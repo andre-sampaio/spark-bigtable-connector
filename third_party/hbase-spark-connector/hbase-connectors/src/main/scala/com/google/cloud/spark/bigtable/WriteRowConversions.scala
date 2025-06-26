@@ -74,28 +74,6 @@ class WriteRowConversions(
 
     (rowKeyColumnsBytes zip rowKeyIndexAndFields).foreach {
       case (columnValueBytes, idxAndField) =>
-        // For compound row keys, we first need to validate column values.
-        if (catalog.hasCompoundRowKey) {
-          val field = idxAndField._2
-          field.dt match {
-            // Currently, only string columns with a dynamic length have to be validated.
-            case StringType =>
-              if (field.length == -1) {
-                val delimPos =
-                  columnValueBytes.indexOf(BigtableTableCatalog.delimiter)
-                if (delimPos == -1 || delimPos < columnValueBytes.length - 1) {
-                  throw new IllegalArgumentException(
-                    "Error when writing DataFrame column " + field + " in row "
-                      + sparkRow + ". " + "When using compound row keys, a String type column "
-                      + "should have a fixed length or have *exactly one* delimiter character (byte '0') at the end."
-                  )
-                }
-              }
-            // All other types either have a fixed length (e.g., double), or can only be at the
-            // end of the row key (i.e., byte array) and are validated when creating the catalog).
-            case _ =>
-          }
-        }
         System.arraycopy(
           columnValueBytes,
           0,
@@ -116,7 +94,7 @@ class WriteRowConversions(
   def convertToBigtableRowMutation(row: SparkRow): RowMutationEntry = {
     val rowKeyColumnsBytes: Seq[Array[Byte]] = rowKeyIndexAndFields.map {
       case (index, field) =>
-        Utils.toBytes(row(index), field)
+        field.toByteArray(row(index))
     }
     val rowKeyBytes: Array[Byte] =
       validateAndConvertRowKeyForWrite(rowKeyColumnsBytes, row, catalog)
@@ -125,7 +103,7 @@ class WriteRowConversions(
     columnIndexAndField.map { case (index, field) =>
       val columnValue = row(index)
       if (columnValue != null) {
-        val columnValueBytes = Utils.toBytes(columnValue, field)
+        val columnValueBytes = field.toByteArray(columnValue)
         val columnNameBytes = BytesConverter.toBytes(field.btColName)
         mutation.setCell(
           field.btColFamily,

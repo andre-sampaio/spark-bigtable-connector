@@ -18,6 +18,7 @@
 package com.google.cloud.spark.bigtable
 
 import com.google.cloud.bigtable.data.v2.models.{RowCell, Row => BigtableRow}
+import com.google.cloud.spark.bigtable.catalog.ParsingResult
 import com.google.cloud.spark.bigtable.datasources.{BigtableTableCatalog, Field, ReadRowUtil, Utils}
 import org.apache.spark.sql.types.StringType
 import org.apache.spark.sql.{Row => SparkRow}
@@ -70,63 +71,9 @@ object ReadRowConversions extends Serializable {
       .foldLeft((0, Seq[(Field, Any)]()))((state, field) => {
         val idx = state._1
         val parsed = state._2
-        if (field.length != -1) {
-          val value =
-            Utils.bigtableFieldToScalaType(field, row, idx, field.length)
-          (idx + field.length, parsed ++ Seq((field, value)))
-        } else {
-          field.dt match {
-            // String columns in the row key without a fixed length should end with byte '0' to indicate the delimiter.
-            case StringType =>
-              if (!catalog.hasCompoundRowKey) {
-                // If the row key is simple (i.e., non-compound), consider the entire row key bytes
-                // (i.e., starting at index `idx` with length `row.length - idx`)
-                // Example: row key = bytes("foo\u0000bar\u0000")
-                val value = Utils
-                  .bigtableFieldToScalaType(field, row, idx, row.length - idx)
-                (row.length + 1, parsed ++ Seq((field, value)))
-              } else {
-                val pos = row.indexOf(BigtableTableCatalog.delimiter, idx)
-                if (pos == -1 || pos > row.length) {
-                  throw new IllegalArgumentException(
-                    "Error when parsing row key [" + row.mkString(
-                      ", "
-                    ) + "] to DataFrame column "
-                      + field + ". " + "When using compound row keys, a String type column "
-                      + "should have a fixed length or have *exactly one* delimiter character "
-                      + "(byte '0') at the end."
-                  )
-                } else {
-                  // For compound row keys, if the string column (with variable length) ends
-                  // in the delimiter, the bytes starting at `idx` with with length
-                  // `pos - idx + 1` correspond to the column value.
-                  // Example: row key = bytes("foo\u0000") + bytes(100) + bytes("foobar\u0000")
-                  val value = Utils
-                    .bigtableFieldToScalaType(field, row, idx, pos - idx + 1)
-                  (pos + 1, parsed ++ Seq((field, value)))
-                }
-              }
-            // The only non-string type with variable column length supported by
-            // `bigtableFieldToScalaType()` is BinaryType. In this case, consider the rest of
-            // the row key bytes (i.e., starting at index `idx` with length `row.length - idx`)
-            // as the column value.
-            // Example: row key = bytes(100) + bytes(200.0) + Array[Byte](11, 22, 33)
-            case _ =>
-              (
-                row.length + 1,
-                parsed ++ Seq(
-                  (
-                    field,
-                    Utils.bigtableFieldToScalaType(
-                      field,
-                      row,
-                      idx,
-                      row.length - idx
-                    )
-                  )
-                )
-              )
-          }
+        field.fromByteArray(row, idx) match {
+          case ParsingResult(value, consumedBytes) =>
+            (idx + consumedBytes + 1, parsed ++ Seq((field, value)))
         }
       })
       ._2
@@ -165,24 +112,21 @@ object ReadRowConversions extends Serializable {
       (field, null)
     } else {
       val latestCellValue = allCells.head.getValue.toByteArray
-      if ((field.length != -1) && (field.length != latestCellValue.length)) {
-        throw new IllegalArgumentException(
-          "The byte array in Bigtable cell [" + latestCellValue.mkString(
-            ", "
-          ) +
-            "] has length " + latestCellValue.length + ", while column " + field +
-            " requires length " + field.length + "."
-        )
+
+      field.fromByteArray(latestCellValue, 0) match {
+        case ParsingResult(value, consumedBytes) =>
+          if (consumedBytes < latestCellValue.length) {
+            throw new IllegalArgumentException(
+              "The byte array in Bigtable cell [" + latestCellValue.mkString(
+                ", "
+              ) +
+                "] has length " + latestCellValue.length + ", while column " + field +
+                " requires length " + consumedBytes + "."
+            )
+          }
+
+          (field, value)
       }
-      (
-        field,
-        Utils.bigtableFieldToScalaType(
-          field,
-          latestCellValue,
-          0,
-          latestCellValue.length
-        )
-      )
     }
   }
 }

@@ -18,27 +18,13 @@
 package com.google.cloud.spark.bigtable.datasources
 
 import com.google.cloud.spark.bigtable.Logging
+import com.google.cloud.spark.bigtable.catalog.{FieldType, ParsingResult, RowKey}
 import org.apache.avro.Schema
 import org.apache.spark.sql.types._
 import org.apache.yetus.audience.InterfaceAudience
 
 import scala.collection.mutable
 import scala.util.parsing.json.JSON
-
-// As we finalize the encoding of different types, we add support for them.
-object SupportedDataTypes {
-  final val SUPPORTED_TYPES = Array[DataType](
-    BooleanType,
-    ByteType,
-    ShortType,
-    IntegerType,
-    LongType,
-    FloatType,
-    DoubleType,
-    StringType,
-    BinaryType
-  )
-}
 
 // This corresponds to the mapping between a DataFrame column and Bigtable column/row key part.
 @InterfaceAudience.Private
@@ -48,58 +34,14 @@ case class Field(
     btColName: String,
     // `simpleType` should be specified for types such as int, string, etc.,
     // as opposed to List, Struct (where Avro should be used).
-    simpleType: Option[String] = None,
-    avroSchema: Option[String] = None,
-    len: Int = -1
+    fieldType: FieldType
 ) extends Logging {
+
   override def toString = s"$sparkColName $btColFamily $btColName"
   val isRowKey = btColFamily == BigtableTableCatalog.rowKey
   var start: Int = _
-  def schema: Option[Schema] = avroSchema.map { x =>
-    logDebug(s"avro: $x")
-    val p = new Schema.Parser
-    p.parse(x)
-  }
 
-  lazy val exeSchema = schema
-
-  // converter from avro to catalyst structure
-  lazy val avroToCatalyst: Option[Any => Any] = {
-    schema.map(SchemaConverters.createConverterToSQL)
-  }
-
-  // converter from catalyst to avro
-  lazy val catalystToAvro: (Any) => Any = {
-    SchemaConverters.createConverterToAvro(dt, sparkColName, "recordNamespace")
-  }
-
-  val dt: DataType = getDt
-
-  private def getDt: DataType = {
-    val potentiallySimpleType = simpleType.map(DataTypeParserWrapper.parse)
-    if (
-      potentiallySimpleType.nonEmpty
-      && !SupportedDataTypes.SUPPORTED_TYPES.contains(potentiallySimpleType.get)
-    ) {
-      throw new IllegalArgumentException(
-        "DataType " + potentiallySimpleType.get
-          + " is currently not supported for DataFrame columns. Consider converting it to"
-          + " a byte array manually first."
-      )
-    }
-    potentiallySimpleType.getOrElse {
-      schema
-        .map { x =>
-          SchemaConverters.toSqlType(x).dataType
-        }
-        .getOrElse(
-          throw new IllegalArgumentException(
-            "Invalid catalog definition for column " + sparkColName
-              + ". Providing column type or Avro schema is required."
-          )
-        )
-    }
-  }
+  val dt: DataType = fieldType.dataType
 
   var length: Int = {
     if (len == -1) {
@@ -125,25 +67,12 @@ case class Field(
       sparkColName == that.sparkColName && btColFamily == that.btColFamily && btColName == that.btColName
     case _ => false
   }
+
+  def toByteArray(input: Any): Array[Byte] = fieldType.toByteArray(input)
+
+  def fromByteArray(input: Array[Byte], offset: Int): ParsingResult = fieldType.fromByteArray(input, offset)
 }
 
-// The row key definition, with each key refer to the col defined in Field, e.g.,
-// key1:key2:key3
-@InterfaceAudience.Private
-case class RowKey(k: String) {
-  val keys = k.split(":")
-  var fields: Seq[Field] = _
-  var varLength = false
-  def length = {
-    if (varLength) {
-      -1
-    } else {
-      fields.foldLeft(0) { case (x, y) =>
-        x + y.length
-      }
-    }
-  }
-}
 // The map between the column presented to Spark and the Bigtable field
 @InterfaceAudience.Private
 case class SchemaMap(map: mutable.HashMap[String, Field], cqMap: mutable.HashMap[String, Field]) {
@@ -286,16 +215,24 @@ object BigtableTableCatalog {
       .asInstanceOf[Map[String, Map[String, String]]]
       .toIterator
     val schemaMap = mutable.HashMap.empty[String, Field]
+    val isCompoundKey = cIter.count(_._2.getOrElse(cf, rowKey) == rowKey) > 1
     cIter.foreach { case (name, column) =>
-      val len = column.get(length).map(_.toInt).getOrElse(-1)
-      val sAvro = column.get(avro).map(parameters(_))
+      val fieldType = column.get(avro).map(parameters(_)) match {
+        case Some(avroSchema) => FieldType.forAvroSchema(avroSchema, name)
+        case _ => column.get(length).map(_.toInt) match {
+          case Some(l) => FieldType(column(`type`), l)
+          case _ => if (isCompoundKey) {
+            FieldType(column(`type`), delimiter)
+          } else {
+            FieldType(column(`type`))
+          }
+        }
+      }
       val f = Field(
         name,
         column.getOrElse(cf, rowKey),
         column(col),
-        column.get(`type`),
-        sAvro,
-        len
+        fieldType
       )
       schemaMap.+=((name, f))
     }
@@ -320,37 +257,4 @@ object BigtableTableCatalog {
     val rKey = RowKey(map(rowKey).asInstanceOf[String])
     BigtableTableCatalog(tName, rKey, SchemaMap(schemaMap, cqSchemaMap), parameters)
   }
-
-  /* Use the json based definition formated as below
-       (currently only long, string, and binary are supported)
-    val catalog = s"""{
-                      |"table":{"name":"bttable"},
-                      |"rowkey":"key1:key2",
-                      |"columns":{
-                      |"col1":{"cf":"rowkey", "col":"key1", "type":"string"},
-                      |"col2":{"cf":"rowkey", "col":"key2", "type":"double"},
-                      |"col3":{"cf":"cf1", "col":"col2", "type":"binary"},
-                      |"col4":{"cf":"cf1", "col":"col3", "type":"timestamp"},
-                      |"col5":{"cf":"cf1", "col":"col4", "type":"double"},
-                      |"col6":{"cf":"cf1", "col":"col5", "type":"$map"},
-                      |"col7":{"cf":"cf1", "col":"col6", "type":"$array"},
-                      |"col8":{"cf":"cf1", "col":"col7", "type":"$arrayMap"}
-                      |}
-                      |}""".stripMargin
-   */
 }
-
-/** Construct to contains column data that spend SparkSQL and Bigtable
-  *
-  * @param columnName   SparkSQL column name
-  * @param colType      SparkSQL column type
-  * @param columnFamily Bigtable column family
-  * @param qualifier    Bigtable qualifier name
-  */
-@InterfaceAudience.Private
-case class SchemaQualifierDefinition(
-    columnName: String,
-    colType: String,
-    columnFamily: String,
-    qualifier: String
-)
